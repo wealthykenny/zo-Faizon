@@ -1,0 +1,56 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, sans-serif;
+  background: #050816;
+  color: #f2f6ff;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { min-height: 100%; margin: 0; }
+body {
+  background:
+    radial-gradient(circle at top left, rgba(42, 210, 255, 0.2), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(129, 73, 255, 0.14), transparent 24%),
+    linear-gradient(180deg, #02040a, #070b17 30%, #04060d 100%);
+}
+.app-shell { min-height: 100vh; padding: 24px 16px 40px; }
+.hero, .panel, footer { max-width: 1100px; margin-left: auto; margin-right: auto; }
+.hero { display:flex; gap:16px; align-items:center; margin-bottom: 24px; }
+.brand-mark {
+  width:72px; height:72px; border-radius:20px; display:grid; place-items:center;
+  border:1px solid rgba(74, 223, 255, 0.45); box-shadow: 0 0 28px rgba(74,223,255,0.18);
+  background: rgba(18, 24, 39, 0.8); font-size: 28px;
+}
+.hero h1 { margin:0; font-size: clamp(42px, 8vw, 72px); letter-spacing: .08em; }
+.hero p { margin: 0; color:#4adfff; letter-spacing: .3em; }
+.panel {
+  padding: 28px; border-radius: 28px; background: rgba(7, 10, 21, 0.88);
+  border:1px solid rgba(255,255,255,.08); box-shadow: 0 18px 60px rgba(0,0,0,.35);
+}
+section { margin-bottom: 24px; }
+h2 { margin: 0 0 14px; letter-spacing: .12em; font-size: 16px; }
+.subtle { opacity: .7; margin: 8px 0 0; }
+.mode-switch { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; }
+button, select, textarea, .upload-box {
+  width:100%; border:none; border-radius:20px; background:#0b1020; color:#f2f6ff; font: inherit;
+}
+.mode-switch button, .generate-btn, select { padding: 16px 18px; font-weight: 700; cursor: pointer; }
+.mode-switch button.active, .generate-btn {
+  color:#041019; background: linear-gradient(135deg, #33d8ff, #00b8ff); box-shadow: 0 0 28px rgba(0,212,255,.25);
+}
+textarea {
+  min-height: 150px; padding:18px; resize:vertical; border:1px solid rgba(255,255,255,.08);
+}
+.grid-two { display:grid; gap:16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.upload-box {
+  min-height: 56px; display:flex; align-items:center; justify-content:center; border:1px dashed rgba(255,255,255,.18); padding: 14px; text-align:center;
+}
+.upload-box input { display:none; }
+.preview-image, .result-image {
+  display:block; width:100%; max-width:720px; border-radius:24px; border:1px solid rgba(255,255,255,.1); margin: 12px 0 0;
+}
+.generate-btn { padding:18px; font-size: 18px; }
+.error-box, .prompt-box {
+  padding:16px; border-radius:18px; background:#0b1020; white-space: pre-wrap;
+}
+footer { margin-top: 24px; text-align:center; opacity:.75; }
