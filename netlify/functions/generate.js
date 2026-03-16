@@ -1,34 +1,38 @@
-import crypto from 'node:crypto';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { neon } from '@neondatabase/serverless';
-
-const MODE_PRESETS = {
-  realistic: {
-    displayModel: 'Faizon Realistic',
-    routingModel: 'gemini-2.5-pro',
-    fallbackModel: 'gemini-2.5-flash',
-    imageModel: 'gemini-2.5-flash-image-preview',
-    systemPrompt: `You are the cinematic prompt brain for Faizon Realistic.
-Convert user requests into highly detailed photorealistic prompts for premium text-to-image and photorealistic image editing.
-Prioritize realism, skin texture, true-to-life lighting, lens realism, material accuracy, facial detail, and environmental coherence.
-Return strict JSON with keys: productionPrompt, safetyNotes.`
-  },
-  aesthetics: {
-    displayModel: 'Faizon Aesthetics',
-    routingModel: 'gemini-2.5-pro',
-    fallbackModel: 'gemini-2.5-flash',
-    imageModel: 'gemini-2.5-flash-image-preview',
-    systemPrompt: `You are the aesthetic direction engine for Faizon Aesthetics.
-Convert user requests into rich artistic prompts with visual styles like iPhone 4S, 80s photography, radial blur, dual-tone, surreal aesthetics, cottagecore, analog mood, dreamy editorial framing, and nostalgic texture.
-Return strict JSON with keys: productionPrompt, safetyNotes.`
-  }
-};
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Access-Control-Allow-Methods': 'POST,OPTIONS'
 };
+
+const MODE_PRESETS = {
+  realistic: {
+    displayModel: 'Faizon Realistic',
+    routingModel: 'gemini-3.1-pro-preview',
+    fallbackModel: 'gemini-3-flash-preview',
+    imageModel: 'gemini-3.1-flash-image-preview',
+    systemPrompt: `You are the cinematic prompt brain for Faizon Realistic.
+Your job is to convert user intent into ultra-detailed, photorealistic production prompts for text-to-image or image editing.
+Always optimize for realism, anatomy, believable lighting, high-end camera language, material accuracy, lens behavior, environmental coherence, and detailed facial rendering.
+Never make the output cartoony unless the user explicitly asks.
+Return strict JSON with keys: productionPrompt, safetyNotes.`
+  },
+  aesthetics: {
+    displayModel: 'Faizon Aesthetics',
+    routingModel: 'gemini-3.1-pro-preview',
+    fallbackModel: 'gemini-3-flash-preview',
+    imageModel: 'gemini-3.1-flash-image-preview',
+    systemPrompt: `You are the aesthetic direction engine for Faizon Aesthetics.
+Transform user intent into highly visual, emotionally charged production prompts with strong artistic identity.
+You specialize in: iPhone 4S snapshots, 80s flash, radial blur, dual-tone, surrealism, cottagecore, analog imperfections, dreamy color cast, editorial framing, liminal atmosphere, youth nostalgia, and experimental fashion imagery.
+Preserve clear subject readability while making the style feel intentional and premium.
+Return strict JSON with keys: productionPrompt, safetyNotes.`
+  }
+};
+
+let keyRotationIndex = 0;
 
 function json(statusCode, body) {
   return {
@@ -48,94 +52,136 @@ function getGeminiKeys() {
     process.env.GEMINI_API_KEY
   ].filter(Boolean);
 
-  if (!keys.length) throw new Error('No Gemini API keys found in Netlify environment variables.');
+  if (!keys.length) {
+    throw new Error('No Gemini API keys found. Add GEMINI_API_KEY_1 to GEMINI_API_KEY_5 in Netlify environment variables.');
+  }
+
   return keys;
 }
 
-function keyOrder(keys, seedText = '') {
-  const seed = crypto.createHash('sha1').update(seedText).digest().readUInt32BE(0);
-  const start = seed % keys.length;
-  return keys.map((_, index) => keys[(start + index) % keys.length]);
+function getOrderedKeys() {
+  const keys = getGeminiKeys();
+  const start = keyRotationIndex % keys.length;
+  keyRotationIndex = (keyRotationIndex + 1) % keys.length;
+  return [...keys.slice(start), ...keys.slice(0, start)];
 }
 
-function shouldRetry(errorMessage) {
-  const text = String(errorMessage || '').toLowerCase();
-  return ['quota', 'rate', '429', '503', 'overloaded', 'temporar', 'unavailable'].some((part) => text.includes(part));
+function isRetryableGeminiError(message = '') {
+  const text = String(message).toLowerCase();
+  return (
+    text.includes('quota') ||
+    text.includes('rate limit') ||
+    text.includes('rate_limit') ||
+    text.includes('resource exhausted') ||
+    text.includes('temporarily unavailable') ||
+    text.includes('deadline exceeded') ||
+    text.includes('internal error') ||
+    text.includes('backend error') ||
+    text.includes('503') ||
+    text.includes('429')
+  );
 }
 
-async function geminiRequest({ model, apiKey, body }) {
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
+async function withGeminiKeyRotation(fn) {
+  const orderedKeys = getOrderedKeys();
+  let lastError;
 
-  const data = await response.json();
-  if (!response.ok) throw new Error(data?.error?.message || `Gemini request failed for ${model}`);
-  return data;
-}
+  for (let i = 0; i < orderedKeys.length; i += 1) {
+    const apiKey = orderedKeys[i];
 
-async function withKeyRotation(seed, worker) {
-  const keys = keyOrder(getGeminiKeys(), seed);
-  let lastError = null;
-
-  for (const key of keys) {
     try {
-      return await worker(key);
+      return await fn(apiKey);
     } catch (error) {
       lastError = error;
-      if (!shouldRetry(error?.message)) throw error;
+      const isLast = i === orderedKeys.length - 1;
+      if (!isRetryableGeminiError(error.message) && !isLast) {
+        throw error;
+      }
+      if (!isLast) continue;
     }
   }
 
   throw lastError || new Error('All Gemini keys failed.');
 }
 
-async function callGeminiJSON({ model, systemInstruction, payload, seed }) {
-  return withKeyRotation(seed, async (apiKey) => {
-    const data = await geminiRequest({
-      model,
-      apiKey,
-      body: {
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        contents: [{ role: 'user', parts: [{ text: JSON.stringify(payload) }] }],
-        generationConfig: { responseMimeType: 'application/json' }
+async function callGeminiJSON({ model, contents, systemInstruction }) {
+  return withGeminiKeyRotation(async (apiKey) => {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemInstruction }]
+          },
+          contents,
+          generationConfig: {
+            responseMimeType: 'application/json'
+          }
+        })
       }
-    });
+    );
 
-    const text = data?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '{}';
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data?.error?.message || `Gemini JSON request failed for ${model}`);
+    }
+
+    const text =
+      data?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '{}';
+
     return JSON.parse(text);
   });
 }
 
-async function callGeminiImage({ model, prompt, aspectRatio, editImage, seed }) {
-  return withKeyRotation(seed, async (apiKey) => {
-    const parts = [{ text: prompt }];
+async function callGeminiImage({ model, textPrompt, aspectRatio, editImage }) {
+  return withGeminiKeyRotation(async (apiKey) => {
+    const parts = [{ text: textPrompt }];
+
     if (editImage?.data && editImage?.mimeType) {
-      parts.push({ inlineData: { data: editImage.data, mimeType: editImage.mimeType } });
+      parts.push({
+        inlineData: {
+          data: editImage.data,
+          mimeType: editImage.mimeType
+        }
+      });
     }
 
-    const data = await geminiRequest({
-      model,
-      apiKey,
-      body: {
-        contents: [{ role: 'user', parts }],
-        generationConfig: {
-          responseModalities: ['TEXT', 'IMAGE'],
-          imageConfig: { aspectRatio }
-        }
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: {
+            responseModalities: ['TEXT', 'IMAGE'],
+            imageConfig: {
+              aspectRatio
+            }
+          }
+        })
       }
-    });
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data?.error?.message || `Gemini image request failed for ${model}`);
+    }
 
     const candidateParts = data?.candidates?.[0]?.content?.parts || [];
     const imagePart = candidateParts.find((part) => part.inlineData?.data);
     const textPart = candidateParts.find((part) => part.text);
 
-    if (!imagePart?.inlineData?.data) throw new Error(textPart?.text || 'No image returned by Gemini.');
+    if (!imagePart?.inlineData?.data) {
+      throw new Error(textPart?.text || 'No image returned by Gemini');
+    }
 
     return {
       image: `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`,
-      base64: imagePart.inlineData.data,
       mimeType: imagePart.inlineData.mimeType,
       modelText: textPart?.text || ''
     };
@@ -143,43 +189,61 @@ async function callGeminiImage({ model, prompt, aspectRatio, editImage, seed }) 
 }
 
 function getS3Client() {
-  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY || !process.env.AWS_REGION || !process.env.S3_BUCKET_NAME) {
+  if (
+    !process.env.S3_ACCESS_KEY_ID ||
+    !process.env.S3_SECRET_ACCESS_KEY ||
+    !process.env.S3_REGION ||
+    !process.env.S3_BUCKET_NAME
+  ) {
     return null;
   }
 
   return new S3Client({
-    region: process.env.AWS_REGION,
+    region: process.env.S3_REGION,
     credentials: {
-      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+      accessKeyId: process.env.S3_ACCESS_KEY_ID,
+      secretAccessKey: process.env.S3_SECRET_ACCESS_KEY
     }
   });
 }
 
-async function uploadToS3({ buffer, mimeType, mode }) {
+function buildPublicS3Url(key) {
+  const publicBase = process.env.S3_PUBLIC_URL?.replace(/\/$/, '');
+  if (publicBase) return `${publicBase}/${key}`;
+  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.S3_REGION}.amazonaws.com/${key}`;
+}
+
+async function uploadImageToS3(dataUrl, mode) {
   const s3 = getS3Client();
   if (!s3) return null;
 
-  const ext = mimeType === 'image/png' ? 'png' : mimeType === 'image/webp' ? 'webp' : 'jpg';
-  const key = `generated/${mode}/${Date.now()}-${crypto.randomUUID()}.${ext}`;
+  const matches = dataUrl.match(/^data:(.+?);base64,(.+)$/);
+  if (!matches) return null;
 
-  await s3.send(new PutObjectCommand({
-    Bucket: process.env.S3_BUCKET_NAME,
-    Key: key,
-    Body: buffer,
-    ContentType: mimeType,
-    CacheControl: 'public, max-age=31536000, immutable',
-    Tagging: 'autodelete=true&ttl=2days'
-  }));
+  const mimeType = matches[1];
+  const base64Data = matches[2];
+  const buffer = Buffer.from(base64Data, 'base64');
+  const extension = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg';
+  const key = `generated/${mode}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${extension}`;
 
-  const publicBase = process.env.AWS_S3_PUBLIC_URL?.replace(/\/$/, '');
-  if (publicBase) return `${publicBase}/${key}`;
-  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: key,
+      Body: buffer,
+      ContentType: mimeType,
+      Tagging: 'autodelete=true&ttl=2days'
+    })
+  );
+
+  return buildPublicS3Url(key);
 }
 
 async function logGeneration(record) {
   if (!process.env.DATABASE_URL) return;
+
   const sql = neon(process.env.DATABASE_URL);
+
   await sql`CREATE TABLE IF NOT EXISTS fazion_generations (
     id BIGSERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -197,17 +261,29 @@ async function logGeneration(record) {
   `;
 }
 
-export default async (request) => {
-  if (request.httpMethod === 'OPTIONS') return { statusCode: 204, headers: CORS };
-  if (request.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' });
+export default async (req) => {
+  if (req.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers: CORS };
+  }
+
+  if (req.httpMethod !== 'POST') {
+    return json(405, { error: 'Method not allowed' });
+  }
 
   try {
-    const { mode = 'realistic', prompt = '', negativePrompt = '', aspectRatio = '1:1', editImage = null } = JSON.parse(request.body || '{}');
-    if (!MODE_PRESETS[mode]) return json(400, { error: 'Invalid mode.' });
-    if (!prompt.trim()) return json(400, { error: 'Prompt is required.' });
+    const { mode = 'realistic', prompt = '', negativePrompt = '', aspectRatio = '1:1', editImage = null } =
+      JSON.parse(req.body || '{}');
+
+    if (!MODE_PRESETS[mode]) {
+      return json(400, { error: 'Invalid mode' });
+    }
+
+    if (!prompt.trim()) {
+      return json(400, { error: 'Prompt is required' });
+    }
 
     const preset = MODE_PRESETS[mode];
-    const seed = `${mode}:${prompt}:${aspectRatio}`;
+
     const routingPayload = {
       userPrompt: prompt.trim(),
       negativePrompt: negativePrompt.trim(),
@@ -220,35 +296,35 @@ export default async (request) => {
       refined = await callGeminiJSON({
         model: preset.routingModel,
         systemInstruction: preset.systemPrompt,
-        payload: routingPayload,
-        seed
+        contents: [{ role: 'user', parts: [{ text: JSON.stringify(routingPayload) }] }]
       });
-    } catch {
+    } catch (error) {
       refined = await callGeminiJSON({
         model: preset.fallbackModel,
         systemInstruction: preset.systemPrompt,
-        payload: routingPayload,
-        seed: `${seed}:fallback`
+        contents: [{ role: 'user', parts: [{ text: JSON.stringify(routingPayload) }] }]
       });
     }
 
     const productionPrompt = [
       refined.productionPrompt,
       negativePrompt.trim() ? `Avoid: ${negativePrompt.trim()}.` : '',
-      editImage ? 'Preserve identity and core composition unless the user explicitly requests structural changes.' : '',
-      'Output must feel premium, visually coherent, and production ready.'
-    ].filter(Boolean).join('\n\n');
+      editImage
+        ? 'Preserve the identity and core composition of the uploaded image unless the user explicitly requests structural changes.'
+        : '',
+      'Output must be polished, premium, visually coherent, and production-ready.'
+    ]
+      .filter(Boolean)
+      .join('\n\n');
 
     const generated = await callGeminiImage({
       model: preset.imageModel,
-      prompt: productionPrompt,
+      textPrompt: productionPrompt,
       aspectRatio,
-      editImage,
-      seed: `${seed}:image`
+      editImage
     });
 
-    const imageBuffer = Buffer.from(generated.base64, 'base64');
-    const imageUrl = await uploadToS3({ buffer: imageBuffer, mimeType: generated.mimeType, mode });
+    const s3Url = await uploadImageToS3(generated.image, mode);
 
     await logGeneration({
       mode,
@@ -256,7 +332,7 @@ export default async (request) => {
       productionPrompt,
       aspectRatio,
       imageModel: preset.imageModel,
-      imageUrl
+      imageUrl: s3Url
     });
 
     return json(200, {
@@ -264,12 +340,13 @@ export default async (request) => {
       displayModel: preset.displayModel,
       routingModel: preset.routingModel,
       imageModel: preset.imageModel,
+      aspectRatio,
       productionPrompt,
       image: generated.image,
-      imageUrl,
+      imageUrl: s3Url,
       imageModelNotes: generated.modelText
     });
   } catch (error) {
-    return json(500, { error: error.message || 'Unknown server error.' });
+    return json(500, { error: error.message || 'Unknown server error' });
   }
 };
